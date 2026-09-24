@@ -70,6 +70,7 @@ enum{XLO,XHI,YLO,YHI,ZLO,ZHI,INTERIOR};         // same as Domain
 
 enum{GS,PS,GSPS};
 enum{SIMPLE,ARRHENIUS};                       // type of reaction
+enum{TWALL_NUMERIC,TWALL_CUSTOM}; // --- Added by Sam Chumney on 9-24-2026 --- //
 enum{PERIODIC,OUTFLOW,REFLECT,SURFACE,AXISYM};           // several files
 enum{PKEEP,PINSERT,PDONE,PDISCARD,PENTRY,PEXIT,PSURF};   // several files
 
@@ -128,8 +129,59 @@ SurfReactAdsorb::SurfReactAdsorb(SPARTA *sparta, int narg, char **arg) :
   if (mode == SURF && surf->nsurf == 0)
     error->all(FLERR,"Cannot use surf_react adsorb when no surfs exist");
 
-  twall = input->numeric(FLERR,arg[iarg+3]);
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  // Surface temperature can be either:
+  //   numeric value, e.g. 1000.0
+  // or a custom per-surface vector, e.g. s_Ta
+  // The latter follows the same syntax used by surf_collide.
+
+  twall_mode = TWALL_NUMERIC;
+  twall_custom_index = -1;
+  twall_name = NULL;
+  twall_persurf = NULL;
+
+  if (strstr(arg[iarg+3],"s_") == arg[iarg+3]) {
+
+    twall_mode = TWALL_CUSTOM;
+
+    // Per-surface custom temperature is only meaningful for
+    // explicit surface elements, not global box faces.
+    if (mode == FACE)
+      error->all(FLERR,
+                 "Surf_react adsorb custom temperature cannot be used "
+                 "with face mode");
+
+    int n = strlen(&arg[iarg+3][2]) + 1;
+    twall_name = new char[n];
+    strcpy(twall_name,&arg[iarg+3][2]);
+
+    twall_custom_index = surf->find_custom(twall_name);
+
+    if (twall_custom_index < 0)
+      error->all(FLERR,
+                 "Surf_react adsorb custom temperature attribute does not exist");
+
+    if (surf->etype[twall_custom_index] != DOUBLE)
+      error->all(FLERR,
+                 "Surf_react adsorb custom temperature attribute is not a double");
+
+    if (surf->esize[twall_custom_index] > 0)
+      error->all(FLERR,
+                 "Surf_react adsorb custom temperature attribute is not a vector");
+
+  } else {
+
+    twall_mode = TWALL_NUMERIC;
+
+    twall = input->numeric(FLERR,arg[iarg+3]);
+
+    if (twall <= 0.0)
+      error->all(FLERR,"Surf_react adsorb twall <= 0.0");
+  }
+
   max_cover = input->numeric(FLERR,arg[iarg+4]);
+
+  // -- End modifications --- //
 
   // species_surf = list of surface species IDs
 
@@ -224,6 +276,7 @@ SurfReactAdsorb::~SurfReactAdsorb()
   if (copy) return;
 
   delete random;
+  delete [] twall_name;  // --- Added by Sam Chumney on 9-24-2026 --- //
 
   // surface species
 
@@ -490,6 +543,56 @@ void SurfReactAdsorb::create_per_surf_state()
 
 /* ---------------------------------------------------------------------- */
 
+
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  /* ----------------------------------------------------------------------
+    update local+ghost values of a custom per-surface temperature
+
+    This follows the same estatus/spread_custom mechanism used by
+    SurfCollide for a custom surface temperature.
+
+    estatus == 0 means the owned custom values need to be spread to
+    local+ghost surface elements.
+  ------------------------------------------------------------------------- */
+
+  void SurfReactAdsorb::update_twall()
+  {
+    if (twall_mode != TWALL_CUSTOM) return;
+
+    if (surf->estatus[twall_custom_index] == 0)
+      surf->spread_custom(twall_custom_index);
+
+    // edvec_local is indexed by the per-type slot ewhich[],
+    // not by the global custom attribute index.
+    twall_persurf =
+      surf->edvec_local[surf->ewhich[twall_custom_index]];
+  }
+
+  /* ----------------------------------------------------------------------
+    return the surface temperature for a face/surface element
+
+    Numeric temperature:
+      same temperature for every surface.
+
+    Custom temperature:
+      temperature associated with local/ghost surface index isurf.
+  ------------------------------------------------------------------------- */
+
+  double SurfReactAdsorb::get_twall(int isurf)
+  {
+    if (twall_mode == TWALL_NUMERIC)
+      return twall;
+
+    double temp = twall_persurf[isurf];
+
+    if (temp <= 0.0)
+      error->one(FLERR,"Surf_react adsorb custom surface temperature <= 0.0");
+
+    return temp;
+  }
+  // --- End modifications --- //
+
+
 void SurfReactAdsorb::init()
 {
   SurfReact::init();
@@ -528,7 +631,7 @@ void SurfReactAdsorb::init()
     } else if (mode == SURF) {
       tau_index = surf->find_custom((char *) "tau");
       if (tau_index < 0)
-	tau_index = surf->add_custom((char *) "tau",DOUBLE,nactive_ps);
+	    tau_index = surf->add_custom((char *) "tau",DOUBLE,nactive_ps);
       tau = surf->edarray[surf->ewhich[tau_index]];
     }
   }
@@ -612,6 +715,11 @@ void SurfReactAdsorb::init()
     area = surf->edvec_local[surf->ewhich[area_index]];
     weight = surf->edvec_local[surf->ewhich[weight_index]];
     if (psflag) tau = surf->edarray_local[surf->ewhich[tau_index]];
+    // --- Added by Sam Chumney on 9-24-2026 --- //
+    // initialize local+ghost custom surface temperature values
+    if (twall_mode == TWALL_CUSTOM)
+      update_twall();    
+    // --- End modifications --- //
   }
 
   // for distributed: setup list of unique surfs
@@ -652,6 +760,16 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
 
   if (mode == FACE) isurf = -(isurf+1);
 
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  // Resolve the temperature for this particular surface element.
+  // For numeric mode this simply returns twall.
+  // For custom mode this accesses the local/ghost s_<name> value.
+  if (twall_mode == TWALL_CUSTOM)
+    update_twall();
+
+  double twall_local = get_twall(isurf);
+  // --- End modifications --- //
+
   // n = # of possible reactions for particle IP
 
   int *list = reactions_gs[ip->ispecies].list;
@@ -677,27 +795,36 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
   for (int i = 0; i < n; i++) {
     r = &rlist_gs[list[i]];
 
+    // --- Added by Sam Chumney on 9-24-2026 --- //
+    double kreact_local = r->k_react;
+
+    if (twall_mode == TWALL_CUSTOM && r->style == ARRHENIUS)
+      kreact_local = r->coeff[0] * pow(twall_local,r->coeff[1]) *
+                     exp(-r->coeff[2]/twall_local);
+
+    // --- End modifications --- //
+
     if (r->style == ARRHENIUS) coeff_val = 3;
 
     switch (r->type) {
     case DISSOCIATION:
       {
         //prob_value[i] = r->coeff[0];
-        prob_value[i] = r->k_react;
+        prob_value[i] = kreact_local; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
     case EXCHANGE:
       {
         //prob_value[i] = r->coeff[0];
-        prob_value[i] = r->k_react;
+        prob_value[i] = kreact_local; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
     case RECOMBINATION:
       {
         //prob_value[i] = r->coeff[0];
-        prob_value[i] = r->k_react;
+        prob_value[i] = kreact_local; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
@@ -722,8 +849,8 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
 
         if (r->kisliuk_flag)
         {
-          double K_ads = r->kisliuk_coeff[0] * pow(twall,r->kisliuk_coeff[1]) *
-          exp(-r->kisliuk_coeff[2]/twall);
+          double K_ads = r->kisliuk_coeff[0] * pow(twall_local,r->kisliuk_coeff[1]) *
+          exp(-r->kisliuk_coeff[2]/twall_local);
           if (surf_cover < 1)
             S_theta = pow((1 - surf_cover) /
                           (1 - surf_cover +
@@ -735,7 +862,7 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
         }
         //scatter_prob = 1 - r->k_react*S_theta;
         //prob_value[i] = 1.0;
-        prob_value[i] = r->k_react*S_theta;
+        prob_value[i] = kreact_local*S_theta; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
@@ -747,8 +874,8 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
         double S_theta = 0.0;
 
         if (r->kisliuk_flag) {
-          double K_ads = r->kisliuk_coeff[0] * pow(twall,r->kisliuk_coeff[1]) *
-            exp(-r->kisliuk_coeff[2]/twall);
+          double K_ads = r->kisliuk_coeff[0] * pow(twall_local,r->kisliuk_coeff[1]) *
+            exp(-r->kisliuk_coeff[2]/twall_local);
           if (surf_cover < 1)
             S_theta = pow((1 - surf_cover) /
                           (1 - surf_cover +
@@ -757,7 +884,7 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
           S_theta = pow((1-surf_cover),r->coeff[coeff_val]);
         }
 
-        prob_value[i] = r->k_react*S_theta;
+        prob_value[i] = kreact_local*S_theta; // --- Added by Sam Chumney on 9-24-2026 --- //
 
         /*
         if (r->state_products[1][0] == 's') {
@@ -780,8 +907,8 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
         double S_theta = 0.0;
 
         if (r->kisliuk_flag) {
-          double K_ads = r->kisliuk_coeff[0] * pow(twall,r->kisliuk_coeff[1]) *
-            exp(-r->kisliuk_coeff[2]/twall);
+          double K_ads = r->kisliuk_coeff[0] * pow(twall_local,r->kisliuk_coeff[1]) *
+            exp(-r->kisliuk_coeff[2]/twall_local);
           if (surf_cover < 1)
             S_theta = pow((1 - surf_cover) /
                           (1 - surf_cover +
@@ -790,7 +917,7 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
           S_theta = pow((1-surf_cover),r->coeff[coeff_val]);
         }
 
-        prob_value[i] = r->k_react*S_theta;
+        prob_value[i] = kreact_local*S_theta; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
@@ -802,8 +929,8 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
         double S_theta = 0.0;
 
         if (r->kisliuk_flag) {
-          double K_ads = r->kisliuk_coeff[0] * pow(twall,r->kisliuk_coeff[1]) *
-            exp(-r->kisliuk_coeff[2]/twall);
+          double K_ads = r->kisliuk_coeff[0] * pow(twall_local,r->kisliuk_coeff[1]) *
+            exp(-r->kisliuk_coeff[2]/twall_local);
           if (surf_cover < 1)
             S_theta = pow((1 - surf_cover) /
                           (1 - surf_cover +
@@ -812,7 +939,7 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
           S_theta = pow((1-surf_cover),r->coeff[coeff_val]);
         }
 
-        prob_value[i] = r->k_react*S_theta;
+        prob_value[i] = kreact_local*S_theta; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
@@ -824,8 +951,8 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
         double S_theta = 0.0;
 
         if (r->kisliuk_flag) {
-          double K_ads = r->kisliuk_coeff[0] * pow(twall,r->kisliuk_coeff[1]) *
-            exp(-r->kisliuk_coeff[2]/twall);
+          double K_ads = r->kisliuk_coeff[0] * pow(twall_local,r->kisliuk_coeff[1]) *
+            exp(-r->kisliuk_coeff[2]/twall_local);
           if (surf_cover < 1)
             S_theta = pow((1 - surf_cover) /
                           (1 - surf_cover +
@@ -834,7 +961,7 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
           S_theta = pow((1-surf_cover),r->coeff[coeff_val]);
         }
 
-        prob_value[i] = r->k_react*S_theta;
+        prob_value[i] = kreact_local*S_theta; // --- Added by Sam Chumney on 9-24-2026 --- //
         break;
       }
 
@@ -848,11 +975,11 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
           // empty-site count clamped at zero for the same reason the
           //   coverage is clamped at full in AA above
 
-          prob_value[i] = 2.0 * r->k_react *
+          prob_value[i] = 2.0 * kreact_local *
             MAX(maxstick - total_state[isurf],(bigint) 0) * ms_inv /
             fabs(dot);
         } else {
-          prob_value[i] = 2.0 * r->k_react / fabs(dot);
+          prob_value[i] = 2.0 * kreact_local / fabs(dot);
         }
         break;
 
@@ -860,7 +987,7 @@ int SurfReactAdsorb::react(Particle::OnePart *&ip, int isurf, double *norm,
 
     case CI:
       {
-        prob_value[i] = r->k_react;
+        prob_value[i] = kreact_local; // --- Added by Sam Chumney on 9-24-2026 --- //
         if (r->energy_flag) {
           double *v = ip->v;
           double dot = MathExtra::dot3(v,norm);
@@ -1270,6 +1397,12 @@ void SurfReactAdsorb::grid_changed()
   area = surf->edvec_local[surf->ewhich[area_index]];
   weight = surf->edvec_local[surf->ewhich[weight_index]];
   if (psflag) tau = surf->edarray_local[surf->ewhich[tau_index]];
+
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  // refresh custom surface temperature after surface/grid redistribution
+  if (twall_mode == TWALL_CUSTOM)
+    update_twall();
+  // --- End modifications --- //
 
   // reset surf->unique and uniqueID vectors
 
@@ -2242,10 +2375,17 @@ void SurfReactAdsorb::readfile_gs(char *fname)
       }
     }
 
+    // --- Added by Sam Chumney on 9-24-2026 --- //
+    // Store the normal reaction rate for numeric-temperature mode.
+    // With a custom per-surface temperature, the Arrhenius rate is
+    // recomputed locally for each surface in react().
+
     r->k_react = r->coeff[0];
-    if (r->style == ARRHENIUS)
+
+    if (twall_mode == TWALL_NUMERIC && r->style == ARRHENIUS)
       r->k_react = r->k_react * pow(twall,r->coeff[1]) *
-        exp(-r->coeff[2]/(twall));
+                   exp(-r->coeff[2]/twall);
+    // --- End modifications --- //
 
     // process 3rd line of reaction
     // NOTE: RIGHT HERE
@@ -2831,9 +2971,18 @@ void SurfReactAdsorb::readfile_ps(char *fname)
       }
     }
 
+    // --- Added by Sam Chumney on 9-24-2026 --- //
+    // Store the normal reaction rate for numeric-temperature mode.
+    // With a custom per-surface temperature, PS_react() computes
+    // the Arrhenius rate separately for each surface.
+
     r->k_react = r->coeff[0];
-    if (r->style == ARRHENIUS) r->k_react = r->k_react * pow(twall,r->coeff[1]) *
-                                 exp(-r->coeff[2]/(twall));
+
+    if (twall_mode == TWALL_NUMERIC && r->style == ARRHENIUS)
+      r->k_react = r->k_react * pow(twall,r->coeff[1]) *
+                   exp(-r->coeff[2]/twall);
+    // --- End modifications --- //
+    
     //nlist_ps++;
 
     // process 3rd line of reaction
@@ -2995,6 +3144,16 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
 {
   if (nactive_ps == 0) return;
 
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  // Make sure the local+ghost custom surface temperature values are
+  // current before evaluating the PS reaction rates.
+
+  if (twall_mode == TWALL_CUSTOM)
+    update_twall();
+
+  double twall_local = get_twall(isurf);
+  // --- End modifications --- //
+
   double fnum = update->fnum;
   double factor = fnum * weight[isurf] / area[isurf];
   double ms_inv = factor/max_cover;
@@ -3018,52 +3177,98 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
     if (rxn_occur[i]) tau[isurf][i] += update->dt*nsync;
   }
 
+  // --- Added by Sam Chumney on 9-24-2026 --- //
   while (1) {
     long int sum_nu_tau = 0;
+
+    /*
+       Recompute reaction availability after every reaction.
+
+       A reaction may have consumed a surface species during the
+       previous iteration, so species_state alone is not sufficient.
+       species_delta contains the changes accumulated during this
+       PS_react() call.
+    */
+
+    for (int i = 0; i < nactive_ps; i++) {
+      r = &rlist_ps[reactions_ps_list[i]];
+      rxn_occur[i] = 1;
+
+      for (int j = 0; j < r->nreactant; j++) {
+        if (r->state_reactants[j][0] == 's') {
+
+          int idx = r->reactants_ad_index[j];
+
+          int current_pop =
+            species_state[isurf][idx] + species_delta[isurf][idx];
+
+          if (current_pop < r->stoich_reactants[j]) {
+            rxn_occur[i] = 0;
+            break;
+          }
+        }
+      }
+    }
 
     for (int i = 0; i < nactive_ps; i++) {
       nu_react[i] = 0.0;
       nu_tau[i] = 0;
+
       if (rxn_occur[i]) {
         r = &rlist_ps[reactions_ps_list[i]];
-        //int react_num = r->index;
 
-        nu_react[i] = r->k_react;
+        // Reaction rate for this particular surface.
+        //
+        // Do NOT modify r->k_react here. r is shared reaction data,
+        // not a per-surface object. Modifying it would make the
+        // result depend on surface traversal order.
+
+        double kreact_local = r->k_react;
+
+        if (twall_mode == TWALL_CUSTOM && r->style == ARRHENIUS)
+          kreact_local = r->coeff[0] *
+                         pow(twall_local,r->coeff[1]) *
+                         exp(-r->coeff[2]/twall_local);
+
+        nu_react[i] = kreact_local;
 
         if (r->type == SB) {
           double surf_cover = total_state[isurf] * ms_inv;
           nu_react[i] *= pow((1-surf_cover),r->stoich_reactants[0]);
+
         } else {
+
           int factor_pow = -1;
-          for (int j=0; j<r->nreactant; j++) {
-          if (r->state_reactants[j][0] == 's') {
-            factor_pow += r->stoich_reactants[j];
-            if (r->part_reactants[j] == 0) {
-              nu_react[i] *= stoich_pow(total_state[isurf],r->stoich_reactants[j]);
-            } else {
-              nu_react[i] *= stoich_pow(species_state[isurf][r->reactants_ad_index[j]],r->stoich_reactants[j]);
+
+          for (int j = 0; j < r->nreactant; j++) {
+
+            if (r->state_reactants[j][0] == 's') {
+
+              factor_pow += r->stoich_reactants[j];
+
+              if (r->part_reactants[j] == 0) {
+                nu_react[i] *=
+                  stoich_pow(total_state[isurf],
+                             r->stoich_reactants[j]);
+              } else {
+                nu_react[i] *=
+                  stoich_pow(
+                    species_state[isurf][r->reactants_ad_index[j]],
+                    r->stoich_reactants[j]);
+              }
             }
           }
+
+          nu_react[i] *= pow(ms_inv,factor_pow);
         }
 
+        nu_tau[i] =
+          MAX(floor(nu_react[i] * tau[isurf][i]),0);
 
-        nu_react[i] *= pow(ms_inv,factor_pow);
-        }
-
-        /*
-        for (int j=0; j<r->nreactant; j++) {
-          nu_react[i] *=
-            stoich_pow(species_state[isurf][r->reactants_ad_index[j]],
-                       r->stoich_reactants[j]);
-          factor_pow += r->stoich_reactants[j];
-        }
-        */
-
-        //nu_tau[i] = MAX(floor(nu_react[i] * tau[isurf][react_num]),0);
-        nu_tau[i] = MAX(floor(nu_react[i] * tau[isurf][i]),0);
         sum_nu_tau += nu_tau[i];
       }
     }
+    // --- End modifications --- //
 
 
     if (sum_nu_tau == 0) break;
