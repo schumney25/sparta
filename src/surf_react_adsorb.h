@@ -51,6 +51,14 @@ class SurfReactAdsorb : public SurfReact {
                                     // every this many steps
   double twall;                     // temperature of face or surf
   double max_cover;
+
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  int twall_mode;                  // TWALL_NUMERIC or TWALL_CUSTOM
+  int twall_custom_index;          // index of custom surface temperature
+  char *twall_name;                // custom attribute name
+  double *twall_persurf;           // local+ghost custom temperature values
+  // --- End modifications --- //  
+  
   int this_index;                   // index of this surf reaction model
                                     // in Surf list of all reaction models
 
@@ -238,6 +246,11 @@ class SurfReactAdsorb : public SurfReact {
 
   void create_per_face_state();
   void create_per_surf_state();
+
+  // --- Added by Sam Chumney on 9-24-2026 --- //
+  void update_twall();
+  double get_twall(int);
+  // --- End modifications --- //
 
   void update_state_face();
   void update_state_surf();
