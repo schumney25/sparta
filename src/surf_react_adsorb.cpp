@@ -3233,8 +3233,14 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
         nu_react[i] = kreact_local;
 
         if (r->type == SB) {
-          double surf_cover = total_state[isurf] * ms_inv;
-          nu_react[i] *= pow((1-surf_cover),r->stoich_reactants[0]);
+          // double surf_cover = total_state[isurf] * ms_inv;
+          // nu_react[i] *= pow((1-surf_cover),r->stoich_reactants[0]);
+
+		  // -- Added by Sam Chumney on 11-18-2026 -- //
+		  // Rate k is given in [1/s]. 
+		  // Events are calculated on a per-site basis, not per-element.
+		  // Divide by ms_inv for site-count and particle weight normalization. 
+		  nu_react[i] = kreact_local / ms_inv; 
 
         } else {
 
