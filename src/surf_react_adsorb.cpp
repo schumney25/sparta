@@ -18,12 +18,15 @@
 #include "stdio.h"
 #include "stdlib.h"
 #include "string.h"
+#include <algorithm>
+#include <unordered_map>
 #include "surf_react_adsorb.h"
 #include "input.h"
 #include "update.h"
 #include "comm.h"
 #include "surf.h"
 #include "grid.h"
+#include "cut2d.h"
 #include "domain.h"
 #include "particle.h"
 #include "collide.h"
@@ -43,6 +46,7 @@ using namespace MathConst;
 
 enum{INT,DOUBLE};                      // several files
 enum{FACE,SURF};
+enum{UNKNOWN,OUTSIDE,INSIDE,OVERLAP};     // same as Grid
 
 #define DELTA_TALLY 1024
 #define DELTA_PART 8                   // make this bigger once debugged
@@ -79,6 +83,12 @@ enum{PKEEP,PINSERT,PDONE,PDISCARD,PENTRY,PEXIT,PSURF};   // several files
 
 // Syntax: surf_react ID adsorb (gs or ps or gs/ps) filename1 {filename2}
 //                    Nsync (face or surf) Tsurf max_cover O CO CO_a CO_b ...
+
+// Host-side data. Kokkos copies the reaction object without owning this table.
+
+struct SurfReactAdsorb::SublimationPieces {
+  std::unordered_map<surfint,std::vector<SublimationPiece>> by_surface;
+};
 
 /* ---------------------------------------------------------------------- */
 
@@ -275,6 +285,7 @@ SurfReactAdsorb::~SurfReactAdsorb()
 {
   if (copy) return;
 
+  delete sublimation_pieces;
   delete random;
   delete [] twall_name;  // --- Added by Sam Chumney on 9-24-2026 --- //
 
@@ -601,6 +612,7 @@ void SurfReactAdsorb::init()
   //              in Surf list of reaction models
 
   this_index = surf->find_react(id);
+  sublimation_pieces_dirty = true;
 
   if (!firstflag) return;
   firstflag = 0;
@@ -1356,6 +1368,7 @@ void SurfReactAdsorb::tally_update()
 
 void SurfReactAdsorb::grid_changed()
 {
+  sublimation_pieces_dirty = true;
   if (mode == FACE || !distributed) return;
 
   if (update->ntimestep % nsync)
@@ -1411,8 +1424,138 @@ void SurfReactAdsorb::grid_changed()
 
 /* ---------------------------------------------------------------------- */
 
+void SurfReactAdsorb::rebuild_sublimation_pieces()
+{
+  Cut2d cut(sparta,1);
+  Surf::Line *lines = surf->lines;
+  Grid::ChildCell *cells = grid->cells;
+  Grid::ChildInfo *cinfo = grid->cinfo;
+  std::vector<SublimationPiece> records;
+  std::vector<int> surface_owners;
+
+  // Send each surface's PS scheduler and its gas-side pieces to its owner.
+  // The scheduler may be on a different rank from any given piece.
+
+  auto add_scheduler = [&](int isurf) {
+    if (lines[isurf].isr != this_index) return;
+    const surfint id = lines[isurf].id;
+    records.push_back({id,me,-1,{0.0,0.0,0.0,0.0},0.0});
+    surface_owners.push_back((id-1) % nprocs);
+  };
+
+  if (distributed) {
+    for (int i = 0; i < surf->nunique; i++) add_scheduler(surf->unique[i]);
+  } else {
+    for (int isurf = me; isurf < surf->nlocal; isurf += nprocs) add_scheduler(isurf);
+  }
+
+  for (int icell = 0; icell < grid->nlocal; icell++) {
+    Grid::ChildCell &cell = cells[icell];
+    if (cell.nsplit <= 0 || cell.nsurf <= 0 || cinfo[icell].type == INSIDE) continue;
+
+    for (int i = 0; i < cell.nsurf; i++) {
+      Surf::Line &line = lines[cell.csurfs[i]];
+      if (line.isr != this_index) continue;
+
+      int birth_cell = icell;
+      if (cell.nsplit > 1) {
+        const Grid::SplitInfo &split = grid->sinfo[cell.isplit];
+        const int subcell = split.csplits[i];
+        if (subcell < 0) continue;
+        birth_cell = split.csubs[subcell];
+      }
+      if (cinfo[birth_cell].volume <= 0.0) continue;
+
+      double path[4];
+      if (cut.clip_external(line.p1,line.p2,cell.lo,cell.hi,path) < 2) continue;
+
+      // A line on a shared grid face belongs to the cell on its gas side.
+      // This also excludes pieces that face out of the simulation box.
+      if (path[0] == path[2] &&
+          ((path[0] == cell.lo[0] && line.norm[0] < 0.0) ||
+           (path[0] == cell.hi[0] && line.norm[0] > 0.0))) continue;
+      if (path[1] == path[3] &&
+          ((path[1] == cell.lo[1] && line.norm[1] < 0.0) ||
+           (path[1] == cell.hi[1] && line.norm[1] > 0.0))) continue;
+
+      Surf::Line clipped = {};
+      clipped.p1[0] = path[0];
+      clipped.p1[1] = path[1];
+      clipped.p2[0] = path[2];
+      clipped.p2[1] = path[3];
+      const double area_rev = surf->axi_line_size(&clipped);
+      if (area_rev <= 0.0) continue;
+
+      records.push_back({line.id,me,birth_cell,{path[0],path[1],path[2],path[3]},
+                         area_rev / cinfo[birth_cell].weight});
+      surface_owners.push_back((line.id-1) % nprocs);
+    }
+  }
+
+  if (records.size() > MAXSMALLINT)
+    error->one(FLERR,"Too many axisymmetric sublimation pieces on one processor");
+
+  const int nrecords = static_cast<int>(records.size());
+  char *buffer;
+  const int nrecv = comm->rendezvous(1,nrecords,
+                                    reinterpret_cast<char *>(records.data()),
+                                    sizeof(SublimationPiece),0,surface_owners.data(),
+                                    route_sublimation_pieces,0,buffer,
+                                    sizeof(SublimationPiece),this);
+  auto *received = reinterpret_cast<SublimationPiece *>(buffer);
+
+  if (!sublimation_pieces) sublimation_pieces = new SublimationPieces;
+  auto &by_surface = sublimation_pieces->by_surface;
+  by_surface.clear();
+  for (int i = 0; i < nrecv; i++) {
+    auto &pieces = by_surface[received[i].surface_id];
+    if (!pieces.empty()) received[i].area_over_weight += pieces.back().area_over_weight;
+    pieces.push_back(received[i]);
+  }
+  memory->sfree(buffer);
+  sublimation_pieces_dirty = false;
+}
+
+/* ----------------------------------------------------------------------
+   forward each gas-side piece to the rank executing PS for its surface
+------------------------------------------------------------------------- */
+
+int SurfReactAdsorb::route_sublimation_pieces(int n, char *inbuf, int &flag,
+                                             int *&procs, char *&outbuf, void *ptr)
+{
+  auto *self = static_cast<SurfReactAdsorb *>(ptr);
+  const auto *records = reinterpret_cast<const SublimationPiece *>(inbuf);
+  std::vector<int> scheduler(self->surf->nown,-1);
+  int npieces = 0;
+  for (int i = 0; i < n; i++) {
+    const SublimationPiece &record = records[i];
+    if (record.icell < 0) scheduler[(record.surface_id-1) / self->nprocs] = record.proc;
+    else npieces++;
+  }
+
+  self->memory->create(procs,npieces,"sr_adsorb:sublimation_procs");
+  outbuf = static_cast<char *>(self->memory->smalloc((bigint) npieces*sizeof(SublimationPiece),
+                                                     "sr_adsorb:sublimation_pieces"));
+  auto *pieces = reinterpret_cast<SublimationPiece *>(outbuf);
+  int j = 0;
+  for (int i = 0; i < n; i++) {
+    const SublimationPiece &record = records[i];
+    if (record.icell < 0) continue;
+    const int proc = scheduler[(record.surface_id-1) / self->nprocs];
+    if (proc < 0) self->error->one(FLERR,"Missing PS scheduler for axisymmetric sublimation");
+    procs[j] = proc;
+    pieces[j++] = record;
+  }
+  flag = 2;
+  return npieces;
+}
+
+/* ---------------------------------------------------------------------- */
+
 void SurfReactAdsorb::PS_chemistry()
 {
+  if (axisymmetric_sublimation && sublimation_pieces_dirty) rebuild_sublimation_pieces();
+
   // zero the mypart vector of particles this proc is adding
 
   npart = 0;
@@ -1543,12 +1686,16 @@ void SurfReactAdsorb::PS_chemistry()
     p = &allpart[i];
     x = p->x;
 
-    icell = grid->id_find_child(0,0,boxlo,boxhi,x);
-    if (icell < 0) continue;
-    if (icell >= grid->nlocal) continue;
-    if (cells[icell].nsplit > 1) {
-      if (dimension == 3) icell = update->split3d(icell,x);
-      else icell = update->split2d(icell,x);
+    if (p->proc >= 0) {
+      if (p->proc != me) continue;
+      icell = p->icell;
+    } else {
+      icell = grid->id_find_child(0,0,boxlo,boxhi,x);
+      if (icell < 0 || icell >= grid->nlocal) continue;
+      if (cells[icell].nsplit > 1) {
+        if (dimension == 3) icell = update->split3d(icell,x);
+        else icell = update->split2d(icell,x);
+      }
     }
 
     particle->add_particle(p->id,p->ispecies,icell,p->x,p->v,p->erot,p->evib);
@@ -2610,6 +2757,7 @@ void SurfReactAdsorb::init_reactions_ps()
     OneReaction_PS *r = &rlist_ps[m];
     if (!r->active) continue;
     nactive_ps++;
+    if (r->type == SB && mode == SURF && domain->axisymmetric) axisymmetric_sublimation = true;
   }
 
   memory->destroy(reactions_ps_list);
@@ -3158,6 +3306,13 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
   double factor = fnum * weight[isurf] / area[isurf];
   double ms_inv = factor/max_cover;
 
+  const std::vector<SublimationPiece> *pieces = nullptr;
+  if (axisymmetric_sublimation) {
+    const auto &by_surface = sublimation_pieces->by_surface;
+    const auto found = by_surface.find(surf->lines[isurf].id);
+    if (found != by_surface.end()) pieces = &found->second;
+  }
+
   int pid;
   Particle::OnePart *p;
 
@@ -3167,6 +3322,12 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
     r = &rlist_ps[reactions_ps_list[i]];
     //int react_num = r->index;
     rxn_occur[i] = 1;
+
+    if (axisymmetric_sublimation && r->type == SB && !pieces) {
+      rxn_occur[i] = 0;
+      tau[isurf][i] = 0.0;
+      continue;
+    }
 
     for (int j=0; j<r->nreactant; j++) {
       if (r->state_reactants[j][0] == 's') {
@@ -3233,14 +3394,12 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
         nu_react[i] = kreact_local;
 
         if (r->type == SB) {
-          // double surf_cover = total_state[isurf] * ms_inv;
-          // nu_react[i] *= pow((1-surf_cover),r->stoich_reactants[0]);
-
-		  // -- Added by Sam Chumney on 11-18-2026 -- //
-		  // Rate k is given in [1/s]. 
-		  // Events are calculated on a per-site basis, not per-element.
-		  // Divide by ms_inv for site-count and particle weight normalization. 
-		  nu_react[i] = kreact_local / ms_inv; 
+          // k is per site per second. Each axisymmetric piece contributes
+          // its revolved area divided by its receiving cell's weight.
+          if (axisymmetric_sublimation)
+            nu_react[i] = pieces ?
+              kreact_local * max_cover * pieces->back().area_over_weight / fnum : 0.0;
+          else nu_react[i] = kreact_local / ms_inv;
 
         } else {
 
@@ -3413,7 +3572,9 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
             double x[3],v[3];
 
             pid = MAXSMALLINT*random->uniform();
-            random_point(isurf,x);
+            const SublimationPiece *piece = nullptr;
+            if (pieces) piece = sample_sublimation_piece(*pieces,x);
+            else random_point(isurf,x);
             v[0] = v[1] = v[2] = 0.0;
 
             particle->add_particle(pid,r->products[0],0,x,v,0.0,0.0);
@@ -3427,7 +3588,7 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
               surf->sc[isc]->persurf_wrapper(p,norm,isurf);
             }
 
-            add_particle_mine(p);
+            add_particle_mine(p,piece);
             particle->nlocal--;
 
             break;
@@ -3441,10 +3602,35 @@ void SurfReactAdsorb::PS_react(int isurf, int isc, double *norm)
 }
 
 /* ----------------------------------------------------------------------
+   sample a gas-side cell piece proportional to A/weight and then sample
+   a point uniformly on its revolved area
+------------------------------------------------------------------------- */
+
+const SurfReactAdsorb::SublimationPiece *SurfReactAdsorb::sample_sublimation_piece(
+    const std::vector<SublimationPiece> &pieces, double *x)
+{
+  const double draw = random->uniform() * pieces.back().area_over_weight;
+  const auto selected = std::lower_bound(pieces.begin(),pieces.end(),draw,
+      [](const SublimationPiece &piece, double value) { return piece.area_over_weight < value; });
+  const double *path = selected->endpoints;
+
+  // Invert the area CDF on a line whose radius varies linearly.
+  double fraction = random->uniform();
+  if (path[1] != path[3] && fraction > 0.0) {
+    const double radius = sqrt((1.0-fraction)*path[1]*path[1] + fraction*path[3]*path[3]);
+    fraction *= (path[1]+path[3]) / (path[1]+radius);
+  }
+  x[0] = path[0] + fraction * (path[2]-path[0]);
+  x[1] = path[1] + fraction * (path[3]-path[1]);
+  x[2] = 0.0;
+  return &*selected;
+}
+
+/* ----------------------------------------------------------------------
    add new particle P to mypart list
 ------------------------------------------------------------------------- */
 
-void SurfReactAdsorb::add_particle_mine(Particle::OnePart *p)
+void SurfReactAdsorb::add_particle_mine(Particle::OnePart *p, const SublimationPiece *piece)
 {
   if (npart == maxmypart) {
     maxmypart += DELTA_PART;
@@ -3459,6 +3645,8 @@ void SurfReactAdsorb::add_particle_mine(Particle::OnePart *p)
   mypart[npart].erot = p->erot;
   mypart[npart].evib = p->evib;
   mypart[npart].dtremain = p->dtremain;
+  mypart[npart].proc = piece ? piece->proc : -1;
+  mypart[npart].icell = piece ? piece->icell : -1;
   npart++;
 }
 
