@@ -23,6 +23,8 @@ SurfReactStyle(adsorb,SurfReactAdsorb)
 
 #include "surf_react.h"
 
+#include <vector>
+
 namespace SPARTA_NS {
 
 class SurfReactAdsorb : public SurfReact {
@@ -198,6 +200,18 @@ class SurfReactAdsorb : public SurfReact {
   // SGK check
   int n_PS_react;
 
+  struct SublimationPiece {
+    surfint surface_id;
+    int proc, icell;                 // receiving proc and its local gas cell
+    double endpoints[4];            // x1,r1,x2,r2
+    double area_over_weight;        // cumulative within each surface after routing
+  };
+
+  bool axisymmetric_sublimation = false;
+  bool sublimation_pieces_dirty = true;
+  struct SublimationPieces;
+  SublimationPieces *sublimation_pieces = nullptr;
+
   // particles added to gas flow by PS surface reactions
 
   struct AddParticle {
@@ -208,6 +222,7 @@ class SurfReactAdsorb : public SurfReact {
     double erot;            // rotational energy
     double evib;            // vibrational energy
     double dtremain;        // fraction of timestep
+    int proc, icell;        // SB destination, or proc = -1 for position lookup
   };
 
   AddParticle *mypart;      // particles this proc adds
@@ -238,9 +253,13 @@ class SurfReactAdsorb : public SurfReact {
   void init_reactions_ps();
   void readfile_ps(char *);
   void PS_react(int, int, double *);
-  void add_particle_mine(Particle::OnePart *);
+  void add_particle_mine(Particle::OnePart *, const SublimationPiece * = nullptr);
   void PS_chemistry();
   void random_point(int, double*);
+  void rebuild_sublimation_pieces();
+  static int route_sublimation_pieces(int, char *, int &, int *&, char *&, void *);
+  const SublimationPiece *sample_sublimation_piece(
+      const std::vector<SublimationPiece> &, double *);
 
   // methods common to both GS and PS
 
